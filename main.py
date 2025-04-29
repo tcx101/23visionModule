@@ -15,8 +15,8 @@ from media.media import *
 from machine import UART
 from machine import FPIOA
 
-picture_width = 400
-picture_height = 240
+picture_width = 480
+picture_height = 320
 
 sensor_id = 2
 sensor = None
@@ -78,13 +78,36 @@ try:
     # 启动传感器
     sensor.run()
 
-    # 定义绿色阈值 (LAB格式)
-    green_threshold = (72, 100, -128, 127, -128, 127)  # 绿色阈值范围
+    # 更改绿色LAB阈值，使其更严格
+    green_threshold = (80, 100, -54, -25, -128, 127)  # 修改后的LAB色彩空间阈值
 
     # 定义绿色色块检测参数
-    min_green_area = 1  # 最小绿色色块面积
-    max_green_area = 800  # 最大绿色色块面积
-    min_green_pixels = 2  # 增加最小像素数量，减少噪点干扰
+    min_green_area = 3  # 增加最小面积要求，避免噪点
+    max_green_area = 2000  # 最大绿色色块面积
+    min_green_pixels = 1  # 增加最小像素数量
+
+    # 帧率计时器
+    last_time = time.ticks_ms()
+    frame_count = 0
+
+    # 调试模式开关，设为False可以关闭大部分打印信息
+    debug_mode = False
+
+    # 添加时间平滑处理的变量，只为矩形平滑，不为绿色色块平滑
+    prev_outer_rect = None
+    prev_inner_rect = None
+    smoothing_factor = 0.7  # 平滑系数，值越大表示历史数据权重越大
+
+    # 帧稳定性计数器
+    stable_frames = 0
+    min_stable_frames = 3  # 最少需要连续稳定的帧数
+
+    # 存储上一帧的有效检测结果
+    last_valid_outer_rect = None
+    last_valid_inner_rect = None
+
+    # 检测结果有效性标志
+    had_valid_detection = False
 
     while True:
         os.exitpoint()
@@ -92,18 +115,25 @@ try:
         # 捕获通道0的图像
         img = sensor.snapshot(chn=CAM_CHN_ID_0)
 
-        # 保存原始图像用于绿色检测
-        img_copy = img.copy()
+        # 保存原始图像用于绿色检测和矩形检测
+        img_green = img.copy()
+        img_rect = img.copy()
 
-        # 对绿色检测图像进行降噪处理
-        img_copy.bilateral(1, color_sigma=0.1, space_sigma=1)
+        # 对绿色检测图像进行降噪和预处理
+        img_green.bilateral(1, color_sigma=0.1, space_sigma=1)
 
         # 创建二值化图像用于检测黑色边框
-        img_binary = img.copy().binary([(0, 50)], invert=False)  # 较低阈值以突出黑色部分
+        # 使用更强的滤波和形态学操作来减少绿色点的影响
+        img_binary = img_rect.copy().bilateral(2, color_sigma=0.2, space_sigma=2)
+        # 使用更低的阈值以确保黑色边框能被检测到
+        img_binary = img_binary.binary([(0, 45)], invert=False)
+
+        # 执行形态学操作去除小噪点（包括可能是绿色点的小区域）
+        img_binary = img_binary.erode(1)
+        img_binary = img_binary.dilate(1)
 
         # 使用二值化图像查找矩形
         rects = img_binary.find_rects(threshold=2000)
-        count = 0  # 初始化线段计数器
 
         # 释放二值化图像，避免内存问题
         del img_binary
@@ -116,42 +146,286 @@ try:
             # 矩形面积
             area = rect.w() * rect.h()
 
-            # 只保留宽高比接近1（接近正方形）且面积在合理范围内的矩形
-            if ratio < 1.3 and area > 2000 and area < (picture_width * picture_height) / 3:
-                valid_rects.append(rect)
+            # 使用更严格的比例限制，确保矩形更接近正方形
+            if ratio < 1.25 and area > 2500 and area < (picture_width * picture_height) / 3:
+                # 检查矩形的周长与面积比例是否合理（矩形周长的平方/面积应该接近16）
+                perimeter = rect.w() * 2 + rect.h() * 2
+                perimeter_area_ratio = (perimeter * perimeter) / area
 
-        # 根据矩形面积排序，面积大的在前面（外圈），面积小的在后面（内圈）
-        sorted_rects = sorted(valid_rects, key=lambda r: r.w() * r.h(), reverse=True)
+                # 理想矩形的比值约为16，允许有10%的误差
+                if 14.4 < perimeter_area_ratio < 17.6:
+                    valid_rects.append(rect)
 
-        # 检测绿色色块
-        green_blobs = img_copy.find_blobs([green_threshold],
-                                    area_threshold=min_green_area,
-                                    pixels_threshold=min_green_pixels,
-                                    merge=True)  # 开启合并以减少重复检测
+        # 改进的矩形排序和筛选逻辑
+        if len(valid_rects) >= 2:
+            # 首先按面积排序
+            area_sorted_rects = sorted(valid_rects, key=lambda r: r.w() * r.h(), reverse=True)
 
-        # 过滤绿色色块
-        valid_green_blobs = []
-        for blob in green_blobs:
-            if min_green_area <= blob.area() <= max_green_area:
-                # 额外检查色块的圆形程度，增强防错处理
+            # 检查是否存在嵌套关系（内圈必须在外圈内部）
+            sorted_rects = []
+            outer_rect = area_sorted_rects[0]  # 假设最大的是外圈
+            outer_center_x = outer_rect.x() + outer_rect.w() // 2
+            outer_center_y = outer_rect.y() + outer_rect.h() // 2
+
+            # 添加外圈
+            sorted_rects.append(outer_rect)
+
+            # 寻找内圈 - 必须在外圈内部且是所有候选中最大的
+            inner_candidates = []
+            for rect in area_sorted_rects[1:]:
+                # 检查矩形中心是否在外圈内部
+                rect_center_x = rect.x() + rect.w() // 2
+                rect_center_y = rect.y() + rect.h() // 2
+
+                # 检查该矩形中心是否在外圈内部
+                if (outer_rect.x() <= rect_center_x <= outer_rect.x() + outer_rect.w() and
+                    outer_rect.y() <= rect_center_y <= outer_rect.y() + outer_rect.h()):
+                    inner_candidates.append(rect)
+
+            # 如果找到内圈候选，选择最大的一个作为内圈
+            if inner_candidates:
+                inner_candidates.sort(key=lambda r: r.w() * r.h(), reverse=True)
+                sorted_rects.append(inner_candidates[0])
+            elif len(area_sorted_rects) > 1:
+                # 如果没有找到嵌套关系，但有多个矩形，就选面积第二大的
+                sorted_rects.append(area_sorted_rects[1])
+        else:
+            # 如果没有足够的矩形，直接使用面积排序
+            sorted_rects = sorted(valid_rects, key=lambda r: r.w() * r.h(), reverse=True)
+
+        # 应用时间平滑来减少闪烁
+        current_detection_valid = False
+
+        if len(sorted_rects) >= 2:
+            # 获取当前帧的外圈和内圈
+            current_outer_rect = sorted_rects[0]
+            current_inner_rect = sorted_rects[1]
+
+            # 判断当前检测是否有效
+            # 计算内外圈尺寸比例
+            inner_size = (current_inner_rect.w() + current_inner_rect.h()) / 2
+            outer_size = (current_outer_rect.w() + current_outer_rect.h()) / 2
+            size_ratio = inner_size / outer_size if outer_size > 0 else 0
+
+            # 计算内外圈中心点的距离
+            inner_center_x = current_inner_rect.x() + current_inner_rect.w() // 2
+            inner_center_y = current_inner_rect.y() + current_inner_rect.h() // 2
+            outer_center_x = current_outer_rect.x() + current_outer_rect.w() // 2
+            outer_center_y = current_outer_rect.y() + current_outer_rect.h() // 2
+            center_distance = ((inner_center_x - outer_center_x)**2 +
+                              (inner_center_y - outer_center_y)**2)**0.5
+
+            # 检测是否在合理范围内
+            if (0.4 <= size_ratio <= 0.95 and
+                center_distance <= (current_outer_rect.w() + current_outer_rect.h()) / 4):
+                current_detection_valid = True
+
+                # 更新最近有效的检测结果
+                last_valid_outer_rect = current_outer_rect
+                last_valid_inner_rect = current_inner_rect
+
+                # 增加稳定帧计数
+                stable_frames += 1
+
+                # 应用平滑处理
+                if prev_outer_rect is not None and prev_inner_rect is not None:
+                    # 平滑外圈位置
+                    smooth_outer_x = int(prev_outer_rect.x() * smoothing_factor +
+                                       current_outer_rect.x() * (1 - smoothing_factor))
+                    smooth_outer_y = int(prev_outer_rect.y() * smoothing_factor +
+                                       current_outer_rect.y() * (1 - smoothing_factor))
+                    smooth_outer_w = int(prev_outer_rect.w() * smoothing_factor +
+                                       current_outer_rect.w() * (1 - smoothing_factor))
+                    smooth_outer_h = int(prev_outer_rect.h() * smoothing_factor +
+                                       current_outer_rect.h() * (1 - smoothing_factor))
+
+                    # 平滑内圈位置
+                    smooth_inner_x = int(prev_inner_rect.x() * smoothing_factor +
+                                       current_inner_rect.x() * (1 - smoothing_factor))
+                    smooth_inner_y = int(prev_inner_rect.y() * smoothing_factor +
+                                       current_inner_rect.y() * (1 - smoothing_factor))
+                    smooth_inner_w = int(prev_inner_rect.w() * smoothing_factor +
+                                       current_inner_rect.w() * (1 - smoothing_factor))
+                    smooth_inner_h = int(prev_inner_rect.h() * smoothing_factor +
+                                       current_inner_rect.h() * (1 - smoothing_factor))
+
+                    # 使用find_rects的结果类型创建新的矩形对象
+                    # 注意：由于无法直接创建Rect对象，我们通过平滑坐标后修改当前的矩形位置
+                    # 更新当前矩形的位置和大小（通过属性访问器）
+                    try:
+                        # 更新外圈
+                        current_outer_rect.set_x(smooth_outer_x)
+                        current_outer_rect.set_y(smooth_outer_y)
+                        current_outer_rect.set_w(smooth_outer_w)
+                        current_outer_rect.set_h(smooth_outer_h)
+
+                        # 更新内圈
+                        current_inner_rect.set_x(smooth_inner_x)
+                        current_inner_rect.set_y(smooth_inner_y)
+                        current_inner_rect.set_w(smooth_inner_w)
+                        current_inner_rect.set_h(smooth_inner_h)
+                    except Exception as e:
+                        # 如果没有set方法，尝试直接修改属性
+                        if debug_mode:
+                            print(f"矩形平滑处理发生错误: {e}")
+
+                    # 更新排序后的矩形列表
+                    sorted_rects[0] = current_outer_rect
+                    sorted_rects[1] = current_inner_rect
+
+                # 更新上一帧的矩形
+                prev_outer_rect = current_outer_rect
+                prev_inner_rect = current_inner_rect
+                had_valid_detection = True
+            else:
+                # 当前帧检测无效，重置稳定帧计数
+                stable_frames = 0
+
+                # 如果有之前有效的检测结果，使用它
+                if had_valid_detection and last_valid_outer_rect is not None and last_valid_inner_rect is not None:
+                    sorted_rects[0] = last_valid_outer_rect
+                    if len(sorted_rects) > 1:
+                        sorted_rects[1] = last_valid_inner_rect
+                    else:
+                        sorted_rects.append(last_valid_inner_rect)
+        else:
+            # 没有足够的矩形，重置稳定帧计数
+            stable_frames = 0
+
+            # 如果有之前有效的检测结果，使用它
+            if had_valid_detection and last_valid_outer_rect is not None and last_valid_inner_rect is not None:
+                sorted_rects = [last_valid_outer_rect, last_valid_inner_rect]
+
+        # 改进的绿色色块检测 - 简化并优化处理
+        try:
+            # 使用修改后的阈值元组进行高效检测
+            all_green_blobs = img_green.find_blobs([green_threshold],
+                                        area_threshold=min_green_area,
+                                        pixels_threshold=min_green_pixels,
+                                        merge=True)
+
+            # 高效过滤绿色色块
+            final_green_blobs = []
+            for blob in all_green_blobs:
+                # 计算圆度
                 perimeter = blob.perimeter()
-                if perimeter > 0:  # 确保周长大于0
-                    circularity = 4 * 3.14159 * blob.area() / (perimeter * perimeter)
-                    if circularity > 0.6:  # 圆形程度阈值
-                        valid_green_blobs.append(blob)
-                else:
-                    # 如果周长为0，直接根据面积判断
-                    if blob.area() >= min_green_area:
-                        valid_green_blobs.append(blob)
+                if perimeter == 0:  # 避免除以零错误
+                    continue
 
-        # 按面积排序绿色色块（面积大的在前）
-        valid_green_blobs.sort(key=lambda b: b.area(), reverse=True)
+                area = blob.area()
+                circularity = 4 * 3.14159 * area / (perimeter * perimeter)
+
+                # 圆度大于0.6且面积在指定范围内
+                if (min_green_area <= area <= max_green_area and
+                    circularity > 0.6):  # 圆度要求
+                    final_green_blobs.append(blob)
+
+            # 按圆度排序，更圆的在前面
+            if len(final_green_blobs) > 1:
+                final_green_blobs.sort(key=lambda b: 4 * 3.14159 * b.area() / (b.perimeter() * b.perimeter() if b.perimeter() > 0 else 1), reverse=True)
+                final_green_blobs = final_green_blobs[:1]  # 只保留最佳的一个
+
+        except Exception as e:
+            if debug_mode:
+                print(f"绿色检测错误: {e}")
+            final_green_blobs = []
 
         # 检查是否有外圈和内圈
         if len(sorted_rects) >= 2:
+            # 获取外圈和内圈
+            outer_rect = sorted_rects[0]
+            inner_rect = sorted_rects[1]
+
             # 直接获取原始检测到的矩形顶点
-            outer_corners = sorted_rects[0].corners()
-            inner_corners = sorted_rects[1].corners()
+            outer_corners = outer_rect.corners()
+            inner_corners = inner_rect.corners()
+
+            # 计算内部矩形的中心点
+            inner_center_x = inner_rect.x() + inner_rect.w() // 2
+            inner_center_y = inner_rect.y() + inner_rect.h() // 2
+
+            # 额外验证：确保内圈在外圈内部
+            outer_center_x = outer_rect.x() + outer_rect.w() // 2
+            outer_center_y = outer_rect.y() + outer_rect.h() // 2
+
+            # 计算内外圈中心点的距离
+            center_distance = ((inner_center_x - outer_center_x)**2 +
+                              (inner_center_y - outer_center_y)**2)**0.5
+
+            # 计算内外圈尺寸比例
+            inner_size = (inner_rect.w() + inner_rect.h()) / 2
+            outer_size = (outer_rect.w() + outer_rect.h()) / 2
+            size_ratio = inner_size / outer_size if outer_size > 0 else 0
+
+            # 如果内圈中心距离外圈中心太远或尺寸比例不合理，可能是错误识别
+            is_valid_nesting = True
+            warning_message = ""
+
+            if center_distance > (outer_rect.w() + outer_rect.h()) / 4:
+                is_valid_nesting = False
+                warning_message = "警告: 内外圈定位偏移!"
+
+            # 内外圈尺寸比例应该在合理范围内（如0.5-0.9）
+            elif size_ratio < 0.4 or size_ratio > 0.95:
+                is_valid_nesting = False
+                warning_message = "警告: 内外圈尺寸比例异常!"
+
+            # 如果检测到问题，显示警告并尝试修正
+            if not is_valid_nesting:
+                img_copy = img.copy()
+                # 使用原始的draw_string函数
+                if debug_mode:
+                    img_copy.draw_string(10, 10, warning_message,
+                                      color=(255, 0, 0), scale=1.5)
+
+                # 尝试在所有的候选矩形中找更合适的内圈
+                if len(valid_rects) > 2:
+                    # 对所有候选重新评估
+                    better_inner = None
+                    best_score = float('inf')
+
+                    for rect in valid_rects:
+                        # 跳过当前的外圈
+                        if rect == outer_rect:
+                            continue
+
+                        # 计算中心点距离和尺寸比例
+                        rect_cx = rect.x() + rect.w() // 2
+                        rect_cy = rect.y() + rect.h() // 2
+                        dist = ((rect_cx - outer_center_x)**2 + (rect_cy - outer_center_y)**2)**0.5
+                        rect_size = (rect.w() + rect.h()) / 2
+                        ratio = rect_size / outer_size
+
+                        # 综合评分: 距离越小越好，尺寸比例越合理越好
+                        # 理想的内圈尺寸比例约为0.6-0.7
+                        dist_score = dist / outer_size
+                        ratio_score = abs(0.65 - ratio) * 2
+                        total_score = dist_score + ratio_score
+
+                        # 如果找到更好的内圈
+                        if total_score < best_score and ratio > 0.4 and ratio < 0.9:
+                            best_score = total_score
+                            better_inner = rect
+
+                    # 如果找到更好的内圈，更新内圈
+                    if better_inner is not None:
+                        inner_rect = better_inner
+                        inner_corners = inner_rect.corners()
+                        inner_center_x = inner_rect.x() + inner_rect.w() // 2
+                        inner_center_y = inner_rect.y() + inner_rect.h() // 2
+                        sorted_rects[1] = better_inner
+                        if debug_mode:
+                            # 使用原始的draw_string函数
+                            img_copy.draw_string(10, 30, "已自动修正内圈",
+                                              color=(0, 255, 0), scale=1.5)
+
+            # 在图像上标记内部矩形的中心点
+            img_copy.draw_cross(inner_center_x, inner_center_y, color=(255, 0, 0), size=10, thickness=2)
+            img_copy.draw_circle(inner_center_x, inner_center_y, 5, color=(255, 0, 0), thickness=2)
+
+            # 在图像上标记外部矩形的中心点
+            img_copy.draw_cross(outer_center_x, outer_center_y, color=(255, 255, 0), size=10, thickness=2)
+            img_copy.draw_circle(outer_center_x, outer_center_y, 5, color=(255, 255, 0), thickness=2)
 
             # 构建数据字符串
             data_str = "@"
@@ -167,22 +441,33 @@ try:
                 else:
                     data_str += f"{corner[0]},{corner[1]}"
 
-            # 如果有检测到绿色色块，添加绿色色块坐标
-            if len(valid_green_blobs) > 0:
-                green_blob = valid_green_blobs[0]  # 取最大的绿色色块
+            # 添加内部矩形中心点坐标
+            data_str += f",{inner_center_x},{inner_center_y}"
+
+            # 如果有检测到绿色色块，添加绿色色块坐标 - 直接使用最佳色块的原始位置，不做平滑处理
+            if final_green_blobs:
+                green_blob = final_green_blobs[0]  # 取最佳的绿色色块
                 data_str += f",{green_blob.cx()},{green_blob.cy()}"
 
             # 添加结束符
             data_str += "#\r\n"
 
             # 通过串口发送数据
-            print("发送数据:", data_str)
+            if debug_mode:
+                print("发送数据:", data_str)
+                print(f"内部矩形中心点: ({inner_center_x}, {inner_center_y})")
+                if len(final_green_blobs) > 0:
+                    print(f"绿色色块中心点: ({final_green_blobs[0].cx()}, {final_green_blobs[0].cy()})")
             uart.write(data_str)
 
-        print("------矩形统计开始------")
-        print(f"检测到 {len(valid_rects)} 个有效矩形，共 {len(rects)} 个矩形")
-        print(f"检测到 {len(valid_green_blobs)} 个有效绿色色块，共 {len(green_blobs)} 个绿色色块")
+        if debug_mode:
+            print(f"检测到 {len(valid_rects)} 个有效矩形，共 {len(rects)} 个矩形")
+            print(f"检测到 {len(final_green_blobs)} 个有效绿色色块")
 
+        # 叠加显示结果到原始图像
+        img_copy = img.copy()
+
+        # 绘制矩形
         for i, rect in enumerate(sorted_rects):
             # 获取矩形的四个顶点（按顺时针顺序）
             corners = rect.corners()
@@ -191,9 +476,17 @@ try:
             if i == 0:  # 最外圈
                 line_color = (0, 180, 0)  # 绿色
                 line_thickness = 2
+                # 在外圈标记"外"
+                if debug_mode:
+                    img_copy.draw_string(corners[0][0] + 5, corners[0][1] + 20, "外",
+                                   color=(0, 255, 0), scale=2)
             elif i == 1:  # 第二圈
                 line_color = (230, 50, 50)  # 红色
                 line_thickness = 2
+                # 在内圈标记"内"
+                if debug_mode:
+                    img_copy.draw_string(corners[0][0] + 5, corners[0][1] + 20, "内",
+                                   color=(255, 50, 50), scale=2)
             else:  # 其他内圈
                 line_color = (1, 147, 230)  # 蓝色
                 line_thickness = 2
@@ -205,24 +498,43 @@ try:
                 img_copy.draw_line(start_point[0], start_point[1], end_point[0], end_point[1], color=line_color, thickness=line_thickness)
 
             # 在每个矩形的左上角标记序号，帮助识别内外圈
-            img_copy.draw_string(corners[0][0], corners[0][1], f"{i}", color=(255, 255, 255), scale=1)
+            if debug_mode:
+                img_copy.draw_string(corners[0][0], corners[0][1], f"{i}",
+                               color=(255, 255, 255), scale=1)
 
-            print(f"Rect {count}: {rect}, Area: {rect.w() * rect.h()}, Ratio: {max(rect.w(), rect.h()) / min(rect.w(), rect.h())}")
-            count += 1  # 更新计数器
+        # 使用draw_keypoints标记绿色色块位置
+        if final_green_blobs:
+            # 提取绿色色块的关键点
+            keypoints = []
+            for blob in final_green_blobs:
+                # 添加色块中心点作为关键点，确保每个点是三元组 (x, y, response)
+                # 根据错误信息，需要提供3个值而不是2个
+                cx = blob.cx()
+                cy = blob.cy()
+                response = 1.0  # 添加response值，通常是特征点的强度
+                keypoints.append((cx, cy, response))
 
-        # 绘制绿色色块
-        for blob in valid_green_blobs:
-            # 在图像上绘制矩形和绿色色块中心点
-            img_copy.draw_rectangle(blob.rect(), color=(0, 255, 0), thickness=1)
-            img_copy.draw_cross(blob.cx(), blob.cy(), color=(0, 255, 0), size=5, thickness=1)
-
-        print("---------END---------")
+            # 使用draw_keypoints绘制关键点
+            try:
+                img_copy.draw_keypoints(keypoints, color=(0, 255, 0), size=3)
+            except Exception as e:
+                if debug_mode:
+                    print(f"绘制关键点错误: {e}")
+                # 如果绘制关键点失败，使用简单的圆圈标记
+                for point in keypoints:
+                    img_copy.draw_circle(point[0], point[1], 3, color=(0, 255, 0), thickness=2)
 
         # 显示捕获的图像，中心对齐，居中显示
         Display.show_image(img_copy, x=int((DISPLAY_WIDTH - picture_width) / 2), y=int((DISPLAY_HEIGHT - picture_height) / 2))
 
-        # 释放原始图像
-        del img_copy
+        # 计算并显示帧率(每秒更新一次)
+        frame_count += 1
+        if time.ticks_ms() - last_time >= 1000:
+            fps = frame_count
+            if debug_mode:
+                print(f"FPS: {fps}")
+            frame_count = 0
+            last_time = time.ticks_ms()
 
         # 手动触发垃圾回收
         gc.collect()
